@@ -18,20 +18,42 @@ from torch.nn import functional as F
 from gsplat import rasterization
 
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, use_gsplat=True, antialiased=False, separate_sh = False, use_trained_exp=False):
-    if use_gsplat:
-        return render_gsplat(viewpoint_camera, pc, pipe, bg_color, scaling_modifier, override_color, antialiased)
-    else:
-        return render_3dgs(viewpoint_camera, pc, pipe, bg_color, scaling_modifier, separate_sh, override_color, use_trained_exp)
-
-
-# This is code is adapted from ChatSim background gaussians model: 
-# https://github.com/yifanlu0227/ChatSim/blob/main/chatsim/background/gaussian-splatting/gaussian_renderer/gsplat_renderer.py
-def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, antialiased = True, render_normals = False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, use_gsplat=True, antialiased=False, separate_sh = False, use_trained_exp=False, sh_features=None):
     """
-    Render the scene. 
-    
+    Render the scene using Gaussian Splatting.
+
+    Args:
+        viewpoint_camera: Camera viewpoint
+        pc: GaussianModel containing Gaussian parameters
+        pipe: Pipeline parameters
+        bg_color: Background color tensor (must be on GPU)
+        scaling_modifier: Modifier for Gaussian scales
+        override_color: If provided, uses these colors directly (N, 3) instead of SH evaluation
+        use_gsplat: Use gsplat backend if True, else use 3DGS backend
+        antialiased: Enable antialiasing
+        separate_sh: Use separate DC/rest SH (for sparse adam)
+        use_trained_exp: Use trained exposure
+        sh_features: Optional override for SH coefficients (N, K, 3). If provided,
+                     these SH coefficients are used instead of the Gaussian model's stored values.
+                     Useful for physics-to-appearance modulation.
+    """
+    if use_gsplat:
+        return render_gsplat(viewpoint_camera, pc, pipe, bg_color, scaling_modifier, override_color, antialiased, sh_features=sh_features)
+    else:
+        return render_3dgs(viewpoint_camera, pc, pipe, bg_color, scaling_modifier, separate_sh, override_color, use_trained_exp, sh_features=sh_features)
+
+
+# This is code is adapted from ChatSim background gaussians model:
+# https://github.com/yifanlu0227/ChatSim/blob/main/chatsim/background/gaussian-splatting/gaussian_renderer/gsplat_renderer.py
+def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, antialiased = True, render_normals = False, sh_features = None):
+    """
+    Render the scene using gsplat backend.
+
     Background tensor (bg_color) must be on GPU!
+
+    Args:
+        sh_features: Optional override for SH coefficients (N, K, 3). If provided,
+                     uses these instead of pc.get_features for SH-based rendering.
     """
     # Set up rasterization configuration
     if viewpoint_camera.K is not None:
@@ -64,6 +86,10 @@ def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     if override_color is not None:
         colors = override_color # [N, 3]
         sh_degree = None
+    elif sh_features is not None:
+        # Use provided SH features (e.g., from physics modulation)
+        colors = sh_features  # [N, K, 3]
+        sh_degree = pc.active_sh_degree
     else:
         colors = pc.get_features # [N, K, 3]
         sh_degree = pc.active_sh_degree
@@ -168,11 +194,15 @@ def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     return return_pkg
 
 
-def render_3dgs(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+def render_3dgs(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, sh_features = None):
     """
-    Render the scene. 
-    
+    Render the scene using diff_gaussian_rasterization backend.
+
     Background tensor (bg_color) must be on GPU!
+
+    Args:
+        sh_features: Optional override for SH coefficients (N, K, 3). If provided,
+                     uses these instead of pc.get_features for SH-based rendering.
     """
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
@@ -224,18 +254,27 @@ def render_3dgs(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Ten
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     shs = None
     colors_precomp = None
+
+    # Determine which SH features to use (provided sh_features or model's stored features)
+    sh_feats_to_use = sh_features if sh_features is not None else pc.get_features
+
     if override_color is None:
         if pipe.convert_SHs_python:
-            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+            shs_view = sh_feats_to_use.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(sh_feats_to_use.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
         else:
             if separate_sh:
-                dc, shs = pc.get_features_dc, pc.get_features_rest
+                if sh_features is not None:
+                    # Split provided sh_features into DC and rest
+                    dc = sh_features[:, :1, :]  # (N, 1, 3)
+                    shs = sh_features[:, 1:, :]  # (N, K-1, 3)
+                else:
+                    dc, shs = pc.get_features_dc, pc.get_features_rest
             else:
-                shs = pc.get_features
+                shs = sh_feats_to_use
     else:
         colors_precomp = override_color
 
