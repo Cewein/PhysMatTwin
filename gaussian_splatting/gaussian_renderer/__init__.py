@@ -18,7 +18,15 @@ from torch.nn import functional as F
 from gsplat import rasterization
 
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, use_gsplat=True, antialiased=False, separate_sh = False, use_trained_exp=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, use_gsplat=True,
+            antialiased=False, separate_sh = False, use_trained_exp=False, use_neural_appearance=False, stiffness_override=None):
+    # If neural appearance is requested, compute colors from the appearance head
+    if use_neural_appearance and pc.use_neural_appearance_head and override_color is None:
+        neural_colors = pc.compute_neural_colors(
+            viewpoint_camera.camera_center,
+            stiffness_override=stiffness_override
+        )
+        override_color = neural_colors
     if use_gsplat:
         return render_gsplat(viewpoint_camera, pc, pipe, bg_color, scaling_modifier, override_color, antialiased)
     else:
@@ -111,17 +119,13 @@ def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
 
     ##### Our normal rendering #####
     if render_normals:
-
         render_extras = {}
-
         dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
         dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True) # (N, 3)
-
         # compute normal image (reference: GaussianShader)
         normal = pc.get_normal(dir_pp_normalized=dir_pp_normalized)
         normal_normed = normal * 0.5 + 0.5          # from [-1, 1] to [0, 1]
         render_extras["normal"] = normal_normed
-
         out_extras = {}
         for k in render_extras.keys():
             if render_extras[k] is None: continue
@@ -174,14 +178,12 @@ def render_3dgs(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Ten
     
     Background tensor (bg_color) must be on GPU!
     """
- 
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
         screenspace_points.retain_grad()
     except:
         pass
-
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)

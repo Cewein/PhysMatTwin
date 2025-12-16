@@ -1,4 +1,4 @@
-#
+
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
@@ -7,7 +7,6 @@
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
-#
 
 import torch
 import numpy as np
@@ -22,6 +21,8 @@ from simple_knn._C import distCUDA2
 from ..utils.graphics_utils import BasicPointCloud
 from ..utils.general_utils import strip_symmetric, build_scaling_rotation, get_minimum_axis, flip_align_view
 
+from .neural_apparence import NeuralAppearanceHead, normalize_stiffness
+
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
 except:
@@ -35,23 +36,18 @@ class GaussianModel:
             actual_covariance = L @ L.transpose(1, 2)
             symm = strip_symmetric(actual_covariance)
             return symm
-        
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
-
         self.covariance_activation = build_covariance_from_scaling_rotation
-
         self.opacity_activation = torch.sigmoid
         self.inverse_opacity_activation = inverse_sigmoid
-
         self.rotation_activation = torch.nn.functional.normalize
-
         self.isotropic = False
 
-    def __init__(self, sh_degree, optimizer_type="default"):
+    def __init__(self, sh_degree, optimizer_type="default", use_neural_appearance_head=False):
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
-        self.max_sh_degree = sh_degree  
+        self.max_sh_degree = sh_degree
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
@@ -65,6 +61,15 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+        # Neural appearance head for physics-driven appearance
+        self.use_neural_appearance_head = use_neural_appearance_head
+        self.appearance_head = None
+        self.appearance_head_optimizer = None
+        self._stiffness = None  # Per-Gaussian stiffness values
+        self.stiffness_min = 1e3  # Default stiffness bounds
+        self.stiffness_max = 1e5
+        if use_neural_appearance_head:
+            self._init_appearance_head()
 
     def capture(self):
         return (
@@ -159,6 +164,101 @@ class GaussianModel:
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
+
+    def _init_appearance_head(self, hidden_dim=64, num_hidden_layers=3):
+        """Initialize the neural appearance head."""
+        self.appearance_head = NeuralAppearanceHead(
+            sh_degree=self.max_sh_degree,
+            hidden_dim=hidden_dim,
+            num_hidden_layers=num_hidden_layers,
+            use_view_dir=True,
+            use_stiffness=True,
+        ).cuda()
+
+    def setup_appearance_head_optimizer(self, lr=1e-3):
+        """Set up the optimizer for the appearance head."""
+        if self.appearance_head is not None:
+            self.appearance_head_optimizer = torch.optim.Adam(
+                self.appearance_head.parameters(), lr=lr
+            )
+
+    def set_stiffness(self, stiffness: torch.Tensor, stiffness_min: float = None, stiffness_max: float = None):
+        """
+        Set the per-Gaussian stiffness values.
+        Args:
+            stiffness: (N,) tensor of stiffness values
+            stiffness_min: Min value for normalization (optional)
+            stiffness_max: Max value for normalization (optional)
+        """
+        self._stiffness = stiffness.cuda() if not stiffness.is_cuda else stiffness
+        if stiffness_min is not None:
+            self.stiffness_min = stiffness_min
+        if stiffness_max is not None:
+            self.stiffness_max = stiffness_max
+
+    def get_stiffness(self, normalized=True):
+        """
+        Get the stiffness values.
+        Args:
+            normalized: If True, return normalized stiffness in [0, 1]
+        Returns:
+            (N,) tensor of stiffness values
+        """
+        if self._stiffness is None:
+            # Return default stiffness if not set
+            return torch.full((self.get_xyz.shape[0],), 0.5, device="cuda")
+        if normalized:
+            return normalize_stiffness(self._stiffness, self.stiffness_min, self.stiffness_max)
+        return self._stiffness
+
+    def compute_neural_colors(self, camera_center: torch.Tensor, stiffness_override: float = None):
+        """
+        Compute per-Gaussian RGB colors using the neural appearance head.
+        Args:
+            camera_center: (3,) camera center position
+            stiffness_override: If provided, use this value for all Gaussians (for demo)
+        Returns:
+            (N, 3) RGB colors in [0, 1]
+        """
+        if self.appearance_head is None:
+            raise RuntimeError("Neural appearance head not initialized. Set use_neural_appearance_head=True.")
+        # Get SH features
+        sh_features = self.get_features  # (N, K, 3)
+        # Compute view directions (gaussian -> camera is negated for consistency)
+        positions = self.get_xyz  # (N, 3)
+        dir_pp = positions - camera_center.unsqueeze(0)  # (N, 3)
+        view_dirs = dir_pp / (dir_pp.norm(dim=1, keepdim=True) + 1e-8)  # (N, 3)
+        # Get stiffness
+        if stiffness_override is not None:
+            stiffness = torch.full((positions.shape[0],), stiffness_override, device="cuda")
+        else:
+            stiffness = self.get_stiffness(normalized=True)
+        # Compute colors
+        rgb = self.appearance_head(sh_features, view_dirs, stiffness)
+        return rgb
+
+    def save_appearance_head(self, path: str):
+        """Save the appearance head model."""
+        if self.appearance_head is not None:
+            state = {
+                'model_state_dict': self.appearance_head.state_dict(),
+                'stiffness_min': self.stiffness_min,
+                'stiffness_max': self.stiffness_max,
+            }
+            if self.appearance_head_optimizer is not None:
+                state['optimizer_state_dict'] = self.appearance_head_optimizer.state_dict()
+            torch.save(state, path)
+
+    def load_appearance_head(self, path: str):
+        """Load the appearance head model."""
+        if self.appearance_head is None:
+            self._init_appearance_head()
+        checkpoint = torch.load(path, map_location="cuda")
+        self.appearance_head.load_state_dict(checkpoint['model_state_dict'])
+        self.stiffness_min = checkpoint.get('stiffness_min', 1e3)
+        self.stiffness_max = checkpoint.get('stiffness_max', 1e5)
+        if 'optimizer_state_dict' in checkpoint and self.appearance_head_optimizer is not None:
+            self.appearance_head_optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
     def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
