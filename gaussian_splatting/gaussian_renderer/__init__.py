@@ -18,7 +18,35 @@ from torch.nn import functional as F
 from gsplat import rasterization
 
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, use_gsplat=True, antialiased=False, separate_sh = False, use_trained_exp=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, use_gsplat=True, antialiased=False, separate_sh = False, use_trained_exp=False, use_neural_appearance=False, stiffness_override=None):
+    """
+    Render the scene.
+
+    Args:
+        viewpoint_camera: Camera object with pose and intrinsics
+        pc: GaussianModel containing the scene
+        pipe: Pipeline parameters
+        bg_color: Background color tensor (must be on GPU)
+        scaling_modifier: Scale modifier for Gaussians
+        override_color: If provided, use these colors instead of SH evaluation
+        use_gsplat: Use gsplat rasterizer (True) or 3DGS rasterizer (False)
+        antialiased: Enable antialiasing
+        separate_sh: Separate DC and rest SH coefficients
+        use_trained_exp: Use trained exposure correction
+        use_neural_appearance: If True, use neural appearance head for colors
+        stiffness_override: If provided (and use_neural_appearance=True), use this stiffness for all Gaussians (for demo mode)
+
+    Returns:
+        Dictionary with rendered image, depth, normal, etc.
+    """
+    # If neural appearance is requested, compute colors from the appearance head
+    if use_neural_appearance and pc.use_neural_appearance_head and override_color is None:
+        neural_colors = pc.compute_neural_colors(
+            viewpoint_camera.camera_center,
+            stiffness_override=stiffness_override
+        )
+        override_color = neural_colors
+
     if use_gsplat:
         return render_gsplat(viewpoint_camera, pc, pipe, bg_color, scaling_modifier, override_color, antialiased)
     else:

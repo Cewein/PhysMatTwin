@@ -47,9 +47,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+
+    # Create GaussianModel with optional neural appearance head
+    use_neural_appearance = getattr(dataset, 'use_neural_appearance_head', False)
+    gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type, use_neural_appearance_head=use_neural_appearance)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+
+    # Setup appearance head optimizer if enabled
+    if use_neural_appearance and gaussians.appearance_head is not None:
+        appearance_head_lr = getattr(opt, 'appearance_head_lr', 1e-3)
+        gaussians.setup_appearance_head_optimizer(lr=appearance_head_lr)
+        print(f"Neural appearance head enabled with lr={appearance_head_lr}")
+
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -111,6 +121,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if dataset.disable_sh:
             override_color = gaussians.get_features_dc.squeeze()
             render_pkg = render(viewpoint_cam, gaussians, pipe, bg, override_color=override_color, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        elif use_neural_appearance:
+            # Use neural appearance head for rendering
+            render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, use_neural_appearance=True)
         else:
             render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         
@@ -227,6 +240,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                # Save appearance head if enabled
+                if use_neural_appearance and gaussians.appearance_head is not None:
+                    appearance_head_path = os.path.join(scene.model_path, "point_cloud", f"iteration_{iteration}", "appearance_head.pth")
+                    os.makedirs(os.path.dirname(appearance_head_path), exist_ok=True)
+                    gaussians.save_appearance_head(appearance_head_path)
+                    print(f"Saved appearance head to {appearance_head_path}")
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -253,9 +272,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
+                # Step appearance head optimizer if enabled
+                if use_neural_appearance and gaussians.appearance_head_optimizer is not None:
+                    gaussians.appearance_head_optimizer.step()
+                    gaussians.appearance_head_optimizer.zero_grad(set_to_none = True)
+
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                # Save appearance head if enabled
+                if use_neural_appearance and gaussians.appearance_head is not None:
+                    gaussians.save_appearance_head(scene.model_path + "/appearance_head_" + str(iteration) + ".pth")
 
 def prepare_output_and_logger(args):    
     if not args.model_path:

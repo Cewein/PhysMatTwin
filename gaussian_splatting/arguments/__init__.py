@@ -44,7 +44,7 @@ class ParamGroup:
                 setattr(group, arg[0], arg[1])
         return group
 
-class ModelParams(ParamGroup): 
+class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
         self._source_path = ""
@@ -62,6 +62,10 @@ class ModelParams(ParamGroup):
         self.isotropic = False       # set to True if want to use isotropic splatting.
         self.disable_sh = False      # set to True if want to disable SH coefficients during rendering.
         self.eval = False
+        # Neural appearance head parameters
+        self.use_neural_appearance_head = False  # Enable neural appearance head for physics-driven appearance
+        self.appearance_head_hidden_dim = 64     # Hidden dimension for appearance head MLP
+        self.appearance_head_layers = 3          # Number of hidden layers in appearance head
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -107,6 +111,8 @@ class OptimizationParams(ParamGroup):
         self.lambda_seg = 0.0          # 1e-1
         self.random_background = False
         self.optimizer_type = "default"
+        # Neural appearance head learning rate
+        self.appearance_head_lr = 1e-3
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
